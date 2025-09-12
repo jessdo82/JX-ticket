@@ -8,8 +8,8 @@ import asyncio
 
 # 環境變數
 ORIGIN = os.getenv("ORIGIN", "TPE")      # 出發地
-DEST = os.getenv("DEST", "SFO")          # 目的地
-DATE = os.getenv("DATE", "2025-07-30")   # 出發日期（單日模式）
+DEST = os.getenv("DEST", "NRT")          # 目的地
+DATE = os.getenv("DATE", "2025-10-01")   # 出發日期（單日模式）
 DATE_START = os.getenv("DATE_START")     # 起始日期（區間模式，可選）
 DATE_END = os.getenv("DATE_END")         # 結束日期（區間模式，可選）
 TG_TOKEN = os.getenv("TG_TOKEN")
