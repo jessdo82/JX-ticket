@@ -1,10 +1,9 @@
 import os, re, time, json, asyncio
 from datetime import datetime, timedelta
-
 import requests
 from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 
-# ----------------- ENV -----------------
+# ========= 環境變數 =========
 ORIGIN = os.getenv("ALASKA_ORIGIN") or os.getenv("ORIGIN", "TPE")
 DEST   = os.getenv("ALASKA_DEST")   or os.getenv("DEST", "NRT")
 DATE = os.getenv("DATE")
@@ -21,14 +20,14 @@ HEADLESS = (os.getenv("HEADLESS","1")=="1")
 RUN_ONCE = (os.getenv("RUN_ONCE","0")=="1")
 INTERVAL = int(os.getenv("POLL_INTERVAL_SEC") or os.getenv("INTERVAL") or "1800")
 
-DEBUG   = (os.getenv("DEBUG","0")=="1")
+DEBUG   = (os.getenv("DEBUG","1")=="1")   # 預設開
 DEBUG_TG= (os.getenv("DEBUG_TG","0")=="1")
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/123.0.0.0 Safari/537.36")
 
-# ----------------- utils -----------------
+# ========= 小工具 =========
 def log(msg:str): print(f"[{datetime.utcnow():%Y-%m-%d %H:%M:%SZ}] {msg}", flush=True)
 
 def send_tg_text(text:str):
@@ -61,7 +60,7 @@ def format_message(items):
         lines.append(f"• {it['date']} {it['origin']}→{it['dest']} {it.get('flight','JX')} — {it.get('miles','?')} miles — {it.get('cabin','')}")
     return "\n".join(lines)
 
-# ----------------- JSON extract helpers -----------------
+# ========= 解析工具（等拿到 JSON 後就能對欄位） =========
 CABIN_KEYS = ["BUSINESS","FIRST","PREMIUM CLASS","PREMIUM","ECONOMY","MAIN"]
 CARRIER_KEYS = [
     "operatingCarrierCode","operatingCarrier","operatingAirline","operatingAirlineCode",
@@ -71,31 +70,28 @@ CARRIER_KEYS = [
 FLIGHTNUM_KEYS = ["flightNumber","operatingFlightNumber","marketingFlightNumber"]
 MILES_KEYS  = ["miles","awardMiles","priceMiles","lowestAwardMiles","loyaltyMiles","totalMiles"]
 
-def first_str(v):
+def _first_str(v):
     if v is None: return None
     if isinstance(v, (int,float)): return str(v)
     if isinstance(v, str): return v
     return None
 
-def try_extract_from_dict(d:dict):
-    """盡量從單一 dict 取出 carrier/miles/flight/cabin。"""
+def _try_pick_from_dict(d:dict):
     carrier = None
     for k in CARRIER_KEYS:
         if k in d:
-            s = first_str(d[k])
+            s = _first_str(d[k])
             if s and s.strip():
                 carrier = s.strip().upper()
                 break
-    # 允許 STARLUX 或 JX 任一
     if carrier and not (("STARLUX" in carrier) or (carrier == "JX")):
-        # 有些 API 會給 IATA 二碼小寫
         if carrier.upper() != "JX":
             carrier = None
 
     miles = None
     for k in MILES_KEYS:
         if k in d:
-            s = first_str(d[k])
+            s = _first_str(d[k])
             if s:
                 miles = s.replace(",", "")
                 break
@@ -103,63 +99,50 @@ def try_extract_from_dict(d:dict):
     flight = None
     for k in FLIGHTNUM_KEYS:
         if k in d:
-            s = first_str(d[k])
+            s = _first_str(d[k])
             if s:
                 s = re.sub(r"\D", "", s)
                 if s:
-                    flight = f"JX{s}"  # 我們只關注 JX
+                    flight = f"JX{s}"
                     break
 
     cabin = None
-    # 艙等可能在多個欄位（name/code/description）
     for k,v in d.items():
-        s = first_str(v)
+        s = _first_str(v)
         if not s: continue
         u = s.upper()
         for c in CABIN_KEYS:
-            if c in u:
-                cabin = c
-                break
+            if c in u: cabin = c; break
         if cabin: break
 
     return carrier, miles, flight, cabin
 
 def walk_json(obj, date_str:str, out:list):
-    """深度尋找有 JX/STARLUX 航段的節點，組合成結果。"""
     try:
         if isinstance(obj, dict):
-            carrier, miles, flight, cabin = try_extract_from_dict(obj)
+            carrier, miles, flight, cabin = _try_pick_from_dict(obj)
             if carrier == "JX" or (carrier and "STARLUX" in carrier):
-                # 艙等過濾
                 if cabin is None: cabin = "UNKNOWN"
-                if CABIN_FILTER != "ANY" and CABIN_FILTER not in cabin:
-                    pass
-                else:
+                if CABIN_FILTER == "ANY" or (cabin and CABIN_FILTER in cabin):
                     out.append({
                         "date": date_str, "origin": ORIGIN, "dest": DEST,
                         "flight": flight or "JX", "miles": miles or "N/A", "cabin": cabin
                     })
-            # 繼續下探
             for v in obj.values(): walk_json(v, date_str, out)
         elif isinstance(obj, list):
             for v in obj: walk_json(v, date_str, out)
         elif isinstance(obj, str):
             u = obj.upper()
             if ("STARLUX" in u) or (" JX" in u) or u.startswith("JX"):
-                # 從自由文字兜一筆候選
                 cabin = None
                 for c in CABIN_KEYS:
                     if c in u: cabin = c; break
-                if CABIN_FILTER != "ANY" and (not cabin or CABIN_FILTER not in u):
-                    return
-                out.append({
-                    "date": date_str, "origin": ORIGIN, "dest": DEST,
-                    "flight": "JX", "miles": None, "cabin": cabin or "UNKNOWN"
-                })
+                if CABIN_FILTER == "ANY" or (cabin and CABIN_FILTER in (cabin or "")):
+                    out.append({"date":date_str,"origin":ORIGIN,"dest":DEST,"flight":"JX","miles":None,"cabin":cabin or "UNKNOWN"})
     except Exception:
         pass
 
-# ----------------- UI steps + network capture -----------------
+# ========= UI 操作 =========
 CARD_SELECTOR = "div.flight-card, div.akam-flight-card, [data-testid*='flight'], [class*='flight']"
 
 async def do_search_use_miles(page, origin:str, dest:str, date_str:str):
@@ -214,8 +197,7 @@ async def do_search_use_miles(page, origin:str, dest:str, date_str:str):
         return False
     ok1 = await fill_any(re.compile("From|From where|from airport", re.I), origin)
     ok2 = await fill_any(re.compile("To|To where|to airport", re.I), dest)
-    if not (ok1 and ok2):
-        log("[WARN] from/to fallback attempted")
+    if not (ok1 and ok2): log("[WARN] from/to fallback attempted")
 
     # date
     date_mmdd = mmddyyyy(date_str)
@@ -245,63 +227,64 @@ async def do_search_use_miles(page, origin:str, dest:str, date_str:str):
         try: await page.keyboard.press("Enter")
         except Exception: pass
 
-    # 等待請求
     await page.wait_for_load_state("networkidle")
     try: await page.wait_for_selector(CARD_SELECTOR, timeout=20000)
     except PwTimeout: pass
 
+# ========= 跑一天（含：強制 dump/傳 XHR 回應） =========
+def _sanitize(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]", "_", s)[:120]
+
 async def run_day_via_network(p, date_str:str):
-    """操作 UI + 監聽 JSON，並把回應檔案存/傳；從欄位直接找 JX/STARLUX。"""
     browser = await p.chromium.launch(headless=HEADLESS, args=["--no-sandbox"])
     page    = await browser.new_page(locale="en-US", user_agent=UA)
 
-    captured = []  # (kind, url, payload)
-    idx = 0
+    captured = []          # (kind, url, local_path)
+    MAX_SAVE = 20          # 最多保存 20 個回應
+    MAX_TG   = 6           # 最多傳 6 個到 Telegram
 
     async def on_response(resp):
-        nonlocal idx
+        """無條件保存所有 XHR/Fetch 回應（JSON 或文字），並把前幾個直接送到 TG。"""
         try:
-            url = resp.url
-            rt  = resp.request.resource_type
-            if rt not in ("xhr","fetch"): return
-            if "alaskaair.com" not in url: return
-            if not any(k in url.lower() for k in ["shop","search","offer","flight","award","availability","price","calendar"]):
-                return
+            rt = resp.request.resource_type
+            if rt not in ("xhr", "fetch"): return
 
-            ctype = resp.headers.get("content-type","")
-            if "application/json" in ctype:
+            url = resp.url
+            status = resp.status
+            host_part = _sanitize(url.split("//")[-1].split("/")[0])
+            path_part = _sanitize("/".join(url.split("//")[-1].split("/")[1:]) or "root")
+            tag = f"{host_part}_{path_part}_{status}_{date_str}"
+
+            # 優先存 JSON；失敗就存 text
+            try:
                 data = await resp.json()
-                captured.append(("json", url, data))
-                # 存檔（前幾筆傳 TG）
-                if DEBUG:
-                    idx += 1
-                    pth = f"/tmp/resp_{date_str}_{idx}.json"
-                    with open(pth,"w",encoding="utf-8") as f: json.dump(data,f,ensure_ascii=False,indent=2)
-                    log(f"[DEBUG] saved {pth}")
-                    if DEBUG_TG and idx <= 5: send_tg_file(pth, f"resp {idx} {date_str}")
-            else:
-                text = await resp.text()
-                # 嘗試就算 content-type 不是 json 也 parse 一下
-                payload = None
+                pth = f"/tmp/resp_{tag}.json"
+                with open(pth, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                saved = ("json", url, pth, data)
+            except Exception:
                 try:
-                    payload = json.loads(text)
-                    captured.append(("json", url, payload))
-                    if DEBUG:
-                        idx += 1
-                        pth = f"/tmp/resp_{date_str}_{idx}.json"
-                        with open(pth,"w",encoding="utf-8") as f: json.dump(payload,f,ensure_ascii=False,indent=2)
-                        log(f"[DEBUG] saved {pth}")
-                        if DEBUG_TG and idx <= 5: send_tg_file(pth, f"resp {idx} {date_str}")
+                    txt = await resp.text()
                 except Exception:
-                    captured.append(("text", url, text))
-                    if DEBUG:
-                        idx += 1
-                        pth = f"/tmp/resp_{date_str}_{idx}.txt"
-                        with open(pth,"w",encoding="utf-8") as f: f.write(text)
-                        log(f"[DEBUG] saved {pth}")
-                        if DEBUG_TG and idx <= 3: send_tg_file(pth, f"resp {idx} {date_str}")
-        except Exception:
-            pass
+                    body = await resp.body()
+                    txt = f"<<binary {len(body)} bytes>>"
+                pth = f"/tmp/resp_{tag}.txt"
+                with open(pth, "w", encoding="utf-8") as f:
+                    f.write(txt)
+                saved = ("text", url, pth, txt)
+
+            captured.append(saved)
+            log(f"[DUMP] wrote {saved[2]}")
+
+            # 直接送前 MAX_TG 個到 TG（不受 DEBUG_TG 限制）
+            if len([c for c in captured if os.path.exists(c[2])]) <= MAX_TG and TG_TOKEN and TG_CHAT_ID:
+                send_tg_file(saved[2], f"XHR {status} | {url}")
+
+            # 控制數量
+            if len(captured) > MAX_SAVE:
+                captured.pop(0)
+        except Exception as e:
+            log(f"[DUMP] on_response error: {e}")
 
     page.on("response", on_response)
 
@@ -309,25 +292,12 @@ async def run_day_via_network(p, date_str:str):
         await do_search_use_miles(page, ORIGIN, DEST, date_str)
         await page.wait_for_timeout(5000)
 
-        # Debug：頁面也存一下
-        if DEBUG:
-            html_path = f"/tmp/page_{ORIGIN}-{DEST}_{date_str}.html"
-            with open(html_path,"w",encoding="utf-8") as f: f.write(await page.content())
-            log(f"[DEBUG] saved HTML -> {html_path}")
-            if DEBUG_TG: send_tg_file(html_path, f"{ORIGIN}->{DEST} {date_str} HTML")
-
-        # 從 captured 的 JSON/Text 萃取 JX/STARLUX
+        # 從已抓到的 JSON 裡找 JX/STARLUX
         results=[]
-        for kind, url, payload in captured:
-            if kind=="json":
-                walk_json(payload, date_str, results)
-            else:
-                u = payload.upper()
-                if ("STARLUX" in u) or (" JX" in u) or u.startswith("JX"):
-                    results.append({
-                        "date": date_str, "origin": ORIGIN, "dest": DEST,
-                        "flight": "JX", "miles": None, "cabin": "UNKNOWN"
-                    })
+        for kind, url, pth, payload in captured:
+            if kind == "json":
+                try: walk_json(payload, date_str, results)
+                except Exception: pass
 
         # 去重
         uniq={}
@@ -341,10 +311,10 @@ async def run_day_via_network(p, date_str:str):
     finally:
         await browser.close()
 
-# ----------------- Orchestrator -----------------
+# ========= Orchestrator =========
 async def run_once():
-    send_tg_text("✅ JX award monitor started (enhanced JSON mode)")
-    log("=== JX award monitor started (enhanced JSON mode) ===")
+    send_tg_text("✅ JX award monitor started (dump mode)")
+    log("=== JX award monitor started (dump mode) ===")
     log(f"Route: {ORIGIN}->{DEST}  Trip={TRIP_TYPE}  Date={DATE or (DATE_START+'~'+DATE_END)}")
     log(f"Cabin={CABIN_FILTER} Headless={HEADLESS} Interval={INTERVAL}s Debug={DEBUG}/{DEBUG_TG}")
 
