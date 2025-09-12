@@ -1,54 +1,98 @@
 import os
 import re
 import time
-import requests
-from datetime import datetime, timedelta
-from playwright.async_api import async_playwright
 import asyncio
+from datetime import datetime, timedelta
 
-# 環境變數
-ORIGIN = os.getenv("ORIGIN", "TPE")      # 出發地
-DEST = os.getenv("DEST", "NRT")          # 目的地
-DATE = os.getenv("DATE", "2025-10-01")   # 出發日期（單日模式）
-DATE_START = os.getenv("DATE_START")     # 起始日期（區間模式，可選）
-DATE_END = os.getenv("DATE_END")         # 結束日期（區間模式，可選）
-TG_TOKEN = os.getenv("TG_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-HEADLESS = os.getenv("HEADLESS", "1") == "1"
-RUN_ONCE = os.getenv("RUN_ONCE", "0") == "1"
-INTERVAL = int(os.getenv("INTERVAL", "1800"))  # 預設每 30 分鐘跑一次
-CABIN_FILTER = os.getenv("ALASKA_CABIN", "BUSINESS").upper()  # BUSINESS / ECONOMY / PREMIUM / FIRST / MAIN / ANY
+import requests
+from playwright.async_api import async_playwright
 
-async def search_once(p, date_str):
-    """查詢單一天的可用艙等"""
+# ---- Env (支援 ALASKA_* 及簡短名稱，兩者擇一皆可) ----
+ORIGIN = os.getenv("ALASKA_ORIGIN") or os.getenv("ORIGIN", "TPE")
+DEST = os.getenv("ALASKA_DEST") or os.getenv("DEST", "SFO")
+
+DATE = os.getenv("DATE")  # 單日模式可用
+DATE_START = os.getenv("ALASKA_START_DATE") or os.getenv("DATE_START")
+DATE_END = os.getenv("ALASKA_END_DATE") or os.getenv("DATE_END")
+
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TG_TOKEN")
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TG_CHAT_ID")
+
+HEADLESS = (os.getenv("HEADLESS", "1") == "1")
+RUN_ONCE = (os.getenv("RUN_ONCE", "0") == "1")
+INTERVAL = int(os.getenv("POLL_INTERVAL_SEC") or os.getenv("INTERVAL") or "1800")
+
+# 艙等過濾：BUSINESS / ECONOMY / PREMIUM / FIRST / MAIN / ANY
+CABIN_FILTER = os.getenv("ALASKA_CABIN", "BUSINESS").upper()
+
+# ---- Helpers ----
+def log(msg: str):
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+    print(f"[{now}] {msg}", flush=True)
+
+def send_telegram(msg: str):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        log("[WARN] Telegram not configured (skip send)")
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    try:
+        r = requests.post(url, data={"chat_id": TG_CHAT_ID, "text": msg})
+        if r.ok:
+            log("[TEL] sent")
+        else:
+            log(f"[TEL] failed status={r.status_code} body={r.text[:200]}")
+    except Exception as e:
+        log(f"[TEL] exception: {e}")
+
+def format_message(results):
+    lines = ["✨ JX Award Seat Found ✨"]
+    for r in results:
+        lines.append(
+            f"• {r['date']} {r['origin']}→{r['dest']} "
+            f"{r.get('flight','JX')} — {r.get('miles','?')} miles — {r.get('cabin','')}"
+        )
+    return "\n".join(lines)
+
+# ---- Core ----
+async def search_one_date(p, date_str: str):
+    """查詢單一天回傳結果清單"""
     browser = await p.chromium.launch(headless=HEADLESS)
     page = await browser.new_page()
-    url = f"https://www.alaskaair.com/PlanBook/Flights?origin={ORIGIN}&destination={DEST}&departureDate={date_str}&awardBooking=true"
-    await page.goto(url)
-    await page.wait_for_timeout(8000)
-
-    content = await page.inner_text("body")
-    results = []
+    url = (
+        "https://www.alaskaair.com/PlanBook/Flights"
+        f"?origin={ORIGIN}&destination={DEST}"
+        f"&departureDate={date_str}&awardBooking=true"
+    )
+    log(f"[INFO] goto {url}")
+    await page.goto(url, wait_until="load")
+    await page.wait_for_timeout(7000)  # 等前端資料載入
 
     cards = await page.query_selector_all("div.flight-card, div.akam-flight-card, body")
+    results = []
+
     for c in cards:
-        text = await c.inner_text()
+        try:
+            text = await c.inner_text()
+        except Exception:
+            continue
         u = text.upper()
-        if "STARLUX" not in u:   # 只要星宇
+
+        # 只要星宇承運
+        if "STARLUX" not in u:
             continue
 
-        # 嘗試判斷艙等
-        cabin_names = ["BUSINESS", "FIRST", "PREMIUM", "PREMIUM CLASS", "ECONOMY", "MAIN"]
-        found_cabins = [c for c in cabin_names if c in u]
+        # 推測艙等
+        cabin_names = ["BUSINESS", "FIRST", "PREMIUM CLASS", "PREMIUM", "ECONOMY", "MAIN"]
+        found_cabins = [cn for cn in cabin_names if cn in u]
         cabin = found_cabins[0] if found_cabins else "UNKNOWN"
 
-        # 依照設定過濾艙等
+        # 依環境變數過濾
         if CABIN_FILTER != "ANY" and CABIN_FILTER not in u:
             continue
 
+        # miles 與班號
         miles_match = re.search(r"(\d[\d,\.]+)\s*miles", text, re.IGNORECASE)
         miles = miles_match.group(1) if miles_match else "N/A"
-
         fn_match = re.search(r"\bJX\s?\d+\b", text, re.IGNORECASE)
         flight_no = fn_match.group(0) if fn_match else "JX"
 
@@ -62,50 +106,55 @@ async def search_once(p, date_str):
         })
 
     await browser.close()
+    log(f"[INFO] {date_str} found {len(results)} result(s)")
     return results
 
-def format_message(results):
-    lines = ["✨ JX Award Seat Found ✨"]
-    for r in results:
-        lines.append(f"• {r['date']} {r['origin']}→{r['dest']} {r['flight']} — {r['miles']} miles — {r['cabin']}")
-    return "\n".join(lines)
+async def run_once():
+    # 啟動時印出設定摘要
+    log("=== JX monitor started ===")
+    log(f"Route: {ORIGIN}->{DEST}")
+    if DATE_START and DATE_END:
+        log(f"Date range: {DATE_START} ~ {DATE_END}")
+    else:
+        log(f"Date (single): {DATE or (DATE_START or 'N/A')}")
+    log(f"Headless={HEADLESS}  Interval={INTERVAL}s  Cabin={CABIN_FILTER}")
+    log(f"Telegram configured: {bool(TG_TOKEN and TG_CHAT_ID)}")
 
-def send_telegram(msg):
-    if not TG_TOKEN or not TG_CHAT_ID:
-        print("[WARN] Telegram not configured")
-        return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": TG_CHAT_ID, "text": msg})
-
-async def main():
+    results_all = []
     async with async_playwright() as p:
-        results_all = []
         if DATE_START and DATE_END:
             start = datetime.strptime(DATE_START, "%Y-%m-%d")
             end = datetime.strptime(DATE_END, "%Y-%m-%d")
             cur = start
             while cur <= end:
                 ds = cur.strftime("%Y-%m-%d")
-                print(f"[INFO] Checking {ORIGIN}->{DEST} on {ds}...")
-                results = await search_once(p, ds)
-                results_all.extend(results)
+                log(f"[INFO] Checking {ORIGIN}->{DEST} on {ds} ...")
+                try:
+                    results_all.extend(await search_one_date(p, ds))
+                except Exception as e:
+                    log(f"[ERR] {ds} search failed: {e}")
                 cur += timedelta(days=1)
         else:
-            print(f"[INFO] Checking {ORIGIN}->{DEST} on {DATE}...")
-            results = await search_once(p, DATE)
-            results_all.extend(results)
+            ds = DATE or (DATE_START or datetime.utcnow().strftime("%Y-%m-%d"))
+            log(f"[INFO] Checking {ORIGIN}->{DEST} on {ds} ...")
+            try:
+                results_all.extend(await search_one_date(p, ds))
+            except Exception as e:
+                log(f"[ERR] {ds} search failed: {e}")
 
-        if results_all:
-            msg = format_message(results_all)
-            print("[FOUND]", msg)
-            send_telegram(msg)
-        else:
-            print("[NONE] No award seat found")
+    if results_all:
+        msg = format_message(results_all)
+        log("[FOUND] sending Telegram")
+        send_telegram(msg)
+    else:
+        log("[NONE] No award seat found in this run")
 
+# ---- Entry ----
 if __name__ == "__main__":
     if RUN_ONCE:
-        asyncio.run(main())
+        asyncio.run(run_once())
     else:
         while True:
-            asyncio.run(main())
+            asyncio.run(run_once())
+            log(f"[SLEEP] waiting {INTERVAL}s for next run")
             time.sleep(INTERVAL)
