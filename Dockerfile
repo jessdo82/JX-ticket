@@ -1,19 +1,24 @@
-# Use official Playwright base image (includes Chromium + deps)
-FROM mcr.microsoft.com/playwright/python:v1.41.2-jammy
+# 直接用 Playwright 官方基底（含 Chromium 與相依）
+FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
-# Fix: install missing fonts (fonts-unifont) to avoid build failure on Railway
-RUN apt-get update &&     apt-get install -y --no-install-recommends fonts-unifont &&     rm -rf /var/lib/apt/lists/*
+# 補中文字型，避免亂碼
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends fonts-unifont && \
+    rm -rf /var/lib/apt/lists/*
+
+# 乾淨的環境變數設定
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 WORKDIR /app
-
-# Copy project files
 COPY . /app
 
-# Python deps
+# 只安裝需要的套件（Playwright 基底鏡像已自帶瀏覽器）
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Default envs (can be overridden by Railway Variables)
+# 預設環境（Railway Variables 會覆蓋）
 ENV HEADLESS=1 RUN_ONCE=1
 
-# Run the monitor
 CMD ["python", "monitor.py"]
