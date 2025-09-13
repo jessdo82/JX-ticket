@@ -1,163 +1,158 @@
-import os, re, time, json, asyncio
-from datetime import datetime, timedelta
-import requests
+# monitor.py  — clean award-only, JX-only, anti-spam
+import os, asyncio, json, time, re
+from datetime import datetime, timezone
 from playwright.async_api import async_playwright
 
-# ========= ENV =========
-ORIGIN = os.getenv("ALASKA_ORIGIN") or "TPE"
-DEST   = os.getenv("ALASKA_DEST")   or "NRT"
-DATE = os.getenv("DATE")
-DATE_START = os.getenv("ALASKA_START_DATE")
-DATE_END   = os.getenv("ALASKA_END_DATE")
-TRIP_TYPE = (os.getenv("ALASKA_TRIP_TYPE") or "one_way").lower()
+BOT = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT = os.getenv("TELEGRAM_CHAT_ID")
 
-TG_TOKEN   = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-TG_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+ORIGIN  = os.getenv("JX_ORIGIN", "TPE")
+DEST    = os.getenv("JX_DEST",   "NRT")
+DATE    = os.getenv("JX_DATE",   "2025-10-01")
+INTERVAL= int(os.getenv("JX_INTERVAL_SEC", "1800"))
+COOLDOWN= int(os.getenv("JX_TG_COOLDOWN_SEC", "300"))
 
-HEADLESS = (os.getenv("HEADLESS","1")=="1")
-RUN_ONCE = (os.getenv("RUN_ONCE","0")=="1")
+# 僅當這個 flag=1 時，才把所有 XHR/JSON 丟 TG（預設 0）
+API_DUMP = os.getenv("JX_API_DUMP", "0") == "1"
 
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-      "AppleWebKit/537.36 (KHTML, like Gecko) "
-      "Chrome/123.0.0.0 Safari/537.36")
+# 只關注這些「可能是航班可賣/可兌換資料」的請求
+URL_WHITELIST = [
+    r"/award", r"/awardshopping", r"/shopping", r"/availability", r"/offers", r"/flights"
+]
 
-# ========= utils =========
-def log(msg:str): print(f"[{datetime.utcnow():%Y-%m-%d %H:%M:%SZ}] {msg}", flush=True)
+last_tg_sent = 0
 
-def send_tg_text(text:str):
-    if not (TG_TOKEN and TG_CHAT_ID): return
+async def tg_send(text: str):
+    global last_tg_sent
+    now = time.time()
+    if now - last_tg_sent < COOLDOWN:
+        return
+    import aiohttp
+    async with aiohttp.ClientSession() as s:
+        await s.post(f"https://api.telegram.org/bot{BOT}/sendMessage",
+                     json={"chat_id": CHAT, "text": text, "disable_web_page_preview": True})
+    last_tg_sent = now
+
+async def tg_file(path: str, caption: str = ""):
+    # 只用於除錯；常態不會觸發
+    import aiohttp
+    data = {"chat_id": CHAT, "caption": caption}
+    async with aiohttp.ClientSession() as s:
+        with open(path, "rb") as f:
+            form = aiohttp.FormData()
+            for k,v in data.items(): form.add_field(k, str(v))
+            form.add_field("document", f, filename=os.path.basename(path))
+            await s.post(f"https://api.telegram.org/bot{BOT}/sendDocument", data=form)
+
+def looks_like_award_json(obj: dict) -> bool:
+    """非常保守地判斷是不是航班/兌換結果 JSON"""
+    if not isinstance(obj, dict): return False
+    text = json.dumps(obj, ensure_ascii=False)
+    # 關鍵欄位（不同供應端名稱可能不同，所以用多組關鍵字）
+    keys_hit = any(k in text for k in [
+        "flights", "segments", "itineraries", "offers",
+        "operatingCarrierCode", "marketingCarrierCode",
+        "operatingAirlineCode", "marketingAirlineCode",
+        "\"JX\"", "STARLUX", "Starlux"
+    ])
+    # 只要內容有 JX or STARLUX 或者有明顯航班結構，就算
+    return keys_hit
+
+def extract_awards_summary(obj: dict) -> str:
+    """從 JSON 粗略萃取可讀摘要（艙等/航班/里程）"""
+    lines = []
+    def add(line): lines.append(line)
+
+    # 常見字段嘗試
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      data={"chat_id":TG_CHAT_ID,"text":text}, timeout=15)
-    except: pass
+        offers = obj.get("offers") or obj.get("data") or []
+        if isinstance(offers, dict):
+            offers = offers.get("offers", [])
+        cnt = 0
+        for off in offers:
+            # 航司 & 航班
+            carrier = (off.get("operatingCarrierCode")
+                       or off.get("marketingCarrierCode")
+                       or off.get("operatingAirlineCode")
+                       or off.get("marketingAirlineCode"))
+            if carrier and str(carrier).upper() != "JX":
+                continue
+            # 里程/艙等
+            miles = (off.get("miles") or off.get("points") or off.get("awardMiles") or off.get("price"))
+            cabin = (off.get("cabin") or off.get("fareClass") or off.get("bookingClass"))
+            segs  = off.get("segments") or off.get("flights") or []
+            route = []
+            for s in segs:
+                o = s.get("origin") or s.get("from") or s.get("departureAirport") or s.get("dep",{}).get("airport")
+                d = s.get("destination") or s.get("to") or s.get("arrivalAirport") or s.get("arr",{}).get("airport")
+                fno = s.get("flightNumber") or s.get("number")
+                route.append(f"{o}-{d} {fno}")
+            if not route:
+                continue
+            cnt += 1
+            add(f"JX award: {' / '.join(route)} | {cabin or '?'} | {miles}")
+        if cnt:
+            return "\n".join(lines)
+    except Exception:
+        pass
+    # 後備：只說找到 JX 相關結果
+    return "Found possible JX award results (details in JSON)."
 
-def send_tg_file(path:str, caption:str=""):
-    if not (TG_TOKEN and TG_CHAT_ID): return
-    try:
-        with open(path,"rb") as f:
-            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
-                          data={"chat_id":TG_CHAT_ID,"caption":caption},
-                          files={"document":f}, timeout=60)
-    except: pass
+def url_allowed(url: str) -> bool:
+    return any(re.search(p, url) for p in URL_WHITELIST)
 
-def mmddyyyy(iso:str)->str:
-    return datetime.strptime(iso,"%Y-%m-%d").strftime("%m/%d/%Y")
+async def run_once():
+    url = (f"https://www.alaskaair.com/planbook/flights?origin={ORIGIN}"
+           f"&destination={DEST}&departureDate={DATE}&awardBooking=true")
+    await tg_send(f"🔍 Checking {ORIGIN}->{DEST} on {DATE} (award only)")
 
-# ========= UI =========
-CARD_SELECTOR = "div.flight-card, div.akam-flight-card, [data-testid*='flight']"
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        page = await browser.new_page()
 
-async def do_search_use_miles(page, origin, dest, date_str):
-    await page.goto("https://www.alaskaair.com/", wait_until="load")
-    await page.wait_for_load_state("networkidle")
-
-    # one-way
-    try:
-        if TRIP_TYPE=="one_way":
-            for lc in [
-                page.get_by_role("radio", name=re.compile("one[- ]?way", re.I)),
-                page.get_by_text(re.compile("^One[- ]?way$", re.I)).nth(0),
-                page.locator("[aria-label*='One-way' i]")
-            ]:
-                if await lc.is_visible(timeout=1500): await lc.click(); break
-    except: pass
-
-    # use miles
-    try:
-        for lc in [
-            page.get_by_label(re.compile("Use miles|award", re.I)),
-            page.get_by_role("checkbox", name=re.compile("Use miles|award", re.I)),
-            page.locator("input[type='checkbox'][name*='award' i]")
-        ]:
-            if await lc.is_visible(timeout=1500): await lc.click(); break
-    except: pass
-
-    # from/to
-    async def fill_any(label_regex, value):
-        for lc in [page.get_by_label(label_regex),
-                   page.get_by_placeholder(label_regex),
-                   page.get_by_role("textbox", name=label_regex)]:
+        # 攔截 XHR
+        async def on_response(resp):
             try:
-                if await lc.is_visible(timeout=1500):
-                    await lc.click(); await lc.fill(""); await lc.type(value, delay=40)
-                    await page.keyboard.press("Enter"); return True
-            except: pass
-        return False
+                req = resp.request
+                if req.resource_type not in ("xhr", "fetch"):  # 只看 API
+                    return
+                u = req.url
+                if not url_allowed(u):
+                    return
+                ctype = (resp.headers or {}).get("content-type","")
+                if "json" not in ctype:
+                    return
+                text = await resp.text()
+                if not text or text.strip()[0] not in "{[":
+                    return
+                data = json.loads(text)
 
-    await fill_any(re.compile("From", re.I), origin)
-    await fill_any(re.compile("To", re.I), dest)
+                if API_DUMP:
+                    # 只有你把 JX_API_DUMP=1 才會送原始 JSON 做除錯
+                    fname = f"/tmp/resp_{int(time.time())}.json"
+                    with open(fname,"w",encoding="utf-8") as f: f.write(text)
+                    await tg_file(fname, f"XHR 200 | {u}")
 
-    # date
-    try:
-        d=mmddyyyy(date_str)
-        for lc in [page.get_by_label(re.compile("Depart|Departure", re.I)),
-                   page.get_by_placeholder(re.compile("MM/|mm/", re.I))]:
-            if await lc.is_visible(timeout=1500):
-                await lc.fill(""); await lc.type(d, delay=40); await page.keyboard.press("Enter"); break
-    except: pass
+                # 真正通知條件（找到 JX 航班/兌換）
+                if looks_like_award_json(data):
+                    summary = extract_awards_summary(data)
+                    await tg_send(f"✅ Award found (JX)\n{summary}")
+            except Exception:
+                pass
 
-    # submit
-    try:
-        for lc in [page.get_by_role("button", name=re.compile("Find flights|Search", re.I))]:
-            if await lc.is_visible(timeout=1500): await lc.click(); break
-    except: pass
-
-    await page.wait_for_load_state("networkidle")
-    try: await page.wait_for_selector(CARD_SELECTOR, timeout=20000)
-    except: pass
-
-# ========= Run one day =========
-async def run_day(p, date_str):
-    browser = await p.chromium.launch(headless=HEADLESS, args=["--no-sandbox"])
-    page    = await browser.new_page(locale="en-US", user_agent=UA)
-
-    async def on_response(resp):
-        try:
-            if resp.request.resource_type not in ("xhr","fetch"): return
-            url = resp.url
-            status = resp.status
-            tag = re.sub(r"[^a-zA-Z0-9._-]", "_", url)[:120]
-            try:
-                data = await resp.json()
-                path = f"/tmp/resp_{tag}_{date_str}.json"
-                with open(path,"w",encoding="utf-8") as f: json.dump(data,f,ensure_ascii=False,indent=2)
-                send_tg_file(path, f"{status} | {url}")
-            except:
-                try: txt = await resp.text()
-                except: txt = "<<non-text response>>"
-                path = f"/tmp/resp_{tag}_{date_str}.txt"
-                with open(path,"w",encoding="utf-8") as f: f.write(txt)
-                send_tg_file(path, f"{status} | {url}")
-        except Exception as e:
-            log(f"[on_response] {e}")
-
-    page.on("response", on_response)
-
-    try:
-        await do_search_use_miles(page, ORIGIN, DEST, date_str)
-        # 等 30 秒 → 保證 API 回應被抓到
-        await page.wait_for_timeout(30000)
-    finally:
+        page.on("response", on_response)
+        await page.goto(url, wait_until="networkidle")
+        # 給頁面一點時間跑完內部請求
+        await page.wait_for_timeout(8000)
         await browser.close()
 
-# ========= Orchestrator =========
-async def run_once():
-    send_tg_text("✅ JX monitor started (ALL JSON mode, 30s wait)")
-    async with async_playwright() as p:
-        if DATE_START and DATE_END:
-            cur = datetime.strptime(DATE_START,"%Y-%m-%d")
-            end = datetime.strptime(DATE_END,"%Y-%m-%d")
-            while cur<=end:
-                ds = cur.strftime("%Y-%m-%d")
-                log(f"[INFO] checking {ds}")
-                await run_day(p, ds)
-                cur += timedelta(days=1)
-        else:
-            ds = DATE or datetime.utcnow().strftime("%Y-%m-%d")
-            await run_day(p, ds)
+async def main():
+    while True:
+        try:
+            await run_once()
+        except Exception as e:
+            await tg_send(f"⚠️ error: {e}")
+        await asyncio.sleep(INTERVAL)
 
-if __name__=="__main__":
-    if RUN_ONCE: asyncio.run(run_once())
-    else:
-        while True:
-            asyncio.run(run_once())
-            time.sleep(1800)
+if __name__ == "__main__":
+    asyncio.run(main())
