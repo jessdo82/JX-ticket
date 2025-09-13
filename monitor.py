@@ -247,13 +247,13 @@ async def run_once(date_str: str):
     avail = not_recently_notified(avail)
     wl    = not_recently_notified(wl)
 
-    if avail:
+        if avail:
         msg_parts.append(fmt_items("✅ JX award AVAILABLE", avail))
     elif wl:
         msg_parts.append(fmt_items("🟡 JX award WAITLIST (no confirmed seats)", wl))
     elif got and others:
-        # 有抓到 JX 結構但沒有明確 seats；若你想把它當作「可能有位」，把這一段改成✅
-        pass  # 目前不通知，保持安靜；除非你要放寬
+        # 放寬：只要有 JX 的里程/艙等，就視為疑似可兌換，先通知
+        msg_parts.append(fmt_items("🟢 JX award POSSIBLE (no seat count in API)", others))
 
     if msg_parts:
         tg_send("\n\n".join(msg_parts))
